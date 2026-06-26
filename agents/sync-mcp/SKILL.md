@@ -53,6 +53,34 @@ Different tools require different identifiers. Check what's available before cal
 
 ---
 
+## Execution Model — Parallel Batches & Retries
+
+Applies to **every CSV/table enrichment** — any mode that loops over rows. Single-row or one-off list requests run directly, no batching.
+
+### Parallelism — 20 rows per batch
+
+When a CSV or table is attached for enrichment, process rows in **parallel batches of 20**:
+
+- Run pre-flight first (credits → column guard → identifier check). Build the to-do list = rows that pass the guard and have the required identifier.
+- Fire **up to 20 MCP tool calls concurrently** — one per row, all in a single message (20 tool_use blocks).
+- Wait for the whole batch to return, write the 20 results back to the CSV, then start the next batch of 20.
+- Repeat until the to-do list is exhausted.
+
+### Retry — up to 4 attempts, 10s apart
+
+Most failures are provider **rate limits**. Any tool call that errors, times out, or returns a rate-limit signal is **retried up to 4 times with a 10-second gap between attempts** before the error is surfaced:
+
+```
+attempt 1 → fail → wait 10s → retry 1 → fail → wait 10s → retry 2
+→ wait 10s → retry 3 → wait 10s → retry 4 → still failing → throw to user
+```
+
+- Retry only the **failed call(s)**, not the whole batch. Rows that already succeeded are written back regardless.
+- A null / empty result is **not** an error — it means "not found." Leave that cell blank, mark `Enrichment Failed` in `Enrichment Status`, do **not** retry.
+- Only after the 4th retry still fails do you stop and report the error to the user (with completed-row count). Auth / insufficient-credit errors are systemic — don't burn retries; report immediately.
+
+---
+
 ## Mode Selection
 
 | User says | Run section |
@@ -97,10 +125,12 @@ If the request is ambiguous, ask which mode before proceeding.
 
 ```
 Pre-flight → check_credits → column guard (skip if Work Email already filled) → LinkedIn gate
-For each row with linkedin_url and empty Work Email:
-  call find_work_email(linkedin_url=..., first_name=..., last_name=..., organization_name=...)
-  write result to Work Email column
-  write to CSV immediately (per-row, not batch)
+Process target rows in parallel batches of 20 (see Execution Model):
+  For each batch of ≤20 rows with linkedin_url and empty Work Email:
+    fire 20 find_work_email(linkedin_url=..., first_name=..., last_name=..., organization_name=...) calls concurrently (one message, 20 tool calls)
+    apply the retry policy to any call that errors / rate-limits (up to 4 retries, 10s gaps)
+    write all returned results to the Work Email column
+    write the batch back to CSV before starting the next batch
 ```
 
 After finding emails, offer to verify them: "Want me to verify deliverability? (0.3 credits/email)"
@@ -485,10 +515,27 @@ Use these to identify warm outbound signals before launching a campaign. Integra
 
 ## CSV Write-back Pattern
 
-Write results **immediately after each row** — never batch all enrichment then write at the end. This way a partial run (error, credit exhaustion, user interrupt) keeps all completed rows.
+Run **20 rows per batch in parallel**, then write that batch back before starting the next — never hold all enrichment until the end. This way a partial run (error, credit exhaustion, user interrupt) keeps every completed batch. Each call carries its own retry policy (4 retries, 10s gaps).
 
 ```python
-import csv, sys
+import csv, time
+from concurrent.futures import ThreadPoolExecutor
+
+BATCH_SIZE = 20      # rows enriched concurrently
+MAX_RETRIES = 4      # retries after the first attempt
+RETRY_GAP = 10       # seconds between attempts
+
+def with_retry(fn, *args):
+    """Call fn; on any error retry up to MAX_RETRIES times, 10s apart, then raise."""
+    last_err = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return fn(*args)
+        except Exception as e:            # rate limit, timeout, transient provider error
+            last_err = e
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_GAP)
+    raise last_err                        # all 4 retries exhausted — surface to user
 
 def enrich_csv(path, linkedin_col, target_col, enrich_fn):
     with open(path, newline="", encoding="utf-8") as f:
@@ -499,26 +546,30 @@ def enrich_csv(path, linkedin_col, target_col, enrich_fn):
     if target_col not in fieldnames:
         fieldnames.append(target_col)
 
-    for i, row in enumerate(rows):
-        if row.get(target_col):          # already filled — skip
-            continue
-        linkedin_url = row.get(linkedin_col, "").strip()
-        if not linkedin_url:             # no LinkedIn URL — skip this row
-            continue
+    # column guard + identifier check → rows still needing enrichment
+    todo = [r for r in rows
+            if not r.get(target_col) and r.get(linkedin_col, "").strip()]
 
-        result = enrich_fn(linkedin_url)  # call the MCP tool
-        row[target_col] = result or ""
+    for start in range(0, len(todo), BATCH_SIZE):
+        batch = todo[start:start + BATCH_SIZE]
 
-        # write back after every row
+        # up to 20 rows concurrently, each wrapped in the retry policy
+        with ThreadPoolExecutor(max_workers=BATCH_SIZE) as pool:
+            results = list(pool.map(
+                lambda r: with_retry(enrich_fn, r[linkedin_col].strip()), batch))
+        for r, result in zip(batch, results):
+            r[target_col] = result or ""
+
+        # write back after each batch so partial runs keep completed rows
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
 
-        print(f"Row {i+2}: {row.get('First Name', '')} → {result}")
+        print(f"Batch {start // BATCH_SIZE + 1}: {len(batch)} rows written")
 ```
 
-Save this pattern to `temp/` if the task requires a standalone script. Adapt `enrich_fn` to whichever MCP tool is being called.
+Save this pattern to `temp/` if the task requires a standalone script. Adapt `enrich_fn` to whichever MCP tool is being called. When enriching by issuing MCP tool calls directly (no script), apply the same shape: 20 concurrent tool calls per message, retry each failure 4× with 10s gaps, write back per batch.
 
 ---
 
@@ -549,7 +600,7 @@ If `total cost > 50 credits`, ask for explicit confirmation before proceeding.
 | Credit balance too low | Stop, report how many rows completed, how many remain |
 | "Coming soon" tool called | Report unavailability, suggest closest available alternative |
 | No `domain` column for company tools | Ask user which column holds the company domain |
-| Rate limit / timeout from provider | Pause, report completed count, ask user to retry or continue later |
+| Rate limit / timeout / transient error from provider | Retry that call up to 4 times with 10s gaps (see Execution Model). If still failing after the 4th retry, stop and report completed count + the error to the user. |
 | Mixed identifiers (some rows have LinkedIn, some have email only) | Segment rows — run linkedin_url-based tools on rows that have it, run reverse lookup on email-only rows, then re-run |
 
 ---
