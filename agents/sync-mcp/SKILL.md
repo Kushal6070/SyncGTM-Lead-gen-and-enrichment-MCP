@@ -2,13 +2,25 @@
 name: sync-mcp
 description: "Use when asked to enrich contacts (emails, phones, mobile), scrape LinkedIn posts/commenters/engagers, look up LinkedIn from email, enrich companies, check job changes, or use any SyncGTM MCP tool. Use when the user says 'enrich emails', 'find phone numbers', 'scrape LinkedIn posts', 'find work email', 'enrich company', 'get LinkedIn posts', 'check job change', 'find mobile', or 'use SyncGTM'. Handles credit checks, column guards, LinkedIn URL requirements, and structured CSV output."
 metadata:
-  version: 1.0.0
-allowed-tools: mcp__syncgtm__check_credits, mcp__syncgtm__enrich_person, mcp__syncgtm__find_work_email, mcp__syncgtm__find_personal_email, mcp__syncgtm__find_work_phone, mcp__syncgtm__find_mobile_number, mcp__syncgtm__verify_email, mcp__syncgtm__validate_whatsapp, mcp__syncgtm__find_linkedin_from_work_email, mcp__syncgtm__find_linkedin_from_personal_email, mcp__syncgtm__linkedin_profile_enrich, mcp__syncgtm__linkedin_profile_posts, mcp__syncgtm__enrich_organization, mcp__syncgtm__find_company_techstack, mcp__syncgtm__find_company_website_traffic, mcp__syncgtm__find_people_within_company, mcp__syncgtm__company_job_listings, mcp__syncgtm__enrich_linkedin_page, mcp__syncgtm__premium_linkedin_page_insights, mcp__syncgtm__linkedin_page_posts, mcp__syncgtm__job_openings_growth_rate, mcp__syncgtm__head_count_growth_rate, mcp__syncgtm__check_job_change, mcp__syncgtm__check_promotions, Read, Edit, Write, Bash(python:*), Bash(python3:*)
+  version: 1.1.0
+allowed-tools: mcp__syncgtm__check_credits, mcp__syncgtm__enrich_person, mcp__syncgtm__find_work_email, mcp__syncgtm__find_personal_email, mcp__syncgtm__find_work_phone, mcp__syncgtm__find_mobile_number, mcp__syncgtm__verify_email, mcp__syncgtm__validate_whatsapp, mcp__syncgtm__find_linkedin_from_work_email, mcp__syncgtm__find_linkedin_from_personal_email, mcp__syncgtm__linkedin_profile_enrich, mcp__syncgtm__linkedin_profile_posts, mcp__syncgtm__enrich_organization, mcp__syncgtm__find_company_techstack, mcp__syncgtm__find_company_website_traffic, mcp__syncgtm__find_people_within_company, mcp__syncgtm__company_job_listings, mcp__syncgtm__search_job_listings, mcp__syncgtm__linkedin_page_jobs, mcp__syncgtm__linkedin_employee_finder, mcp__syncgtm__enrich_linkedin_page, mcp__syncgtm__premium_linkedin_page_insights, mcp__syncgtm__linkedin_page_posts, mcp__syncgtm__job_openings_growth_rate, mcp__syncgtm__head_count_growth_rate, mcp__syncgtm__check_job_change, mcp__syncgtm__check_promotions, Read, Edit, Write, Bash(python:*), Bash(python3:*)
 ---
 
 # sync-mcp — SyncGTM MCP Enrichment Skill
 
 Use SyncGTM MCP tools to enrich contacts and companies from a CSV, a single row, or a list. All tools use waterfall enrichment across Apollo, RocketReach, LeadMagic, Datagma, and others automatically.
+
+---
+
+## CSV First — Always Work From a File
+
+**I work better with a CSV.** Before starting any enrichment or list-building task, always ask the user to provide or create a CSV:
+
+> "I work better with a CSV — can you create one (or share the file you have) so I can track results, skip already-enriched rows, and write back in batches? Even a single-column CSV with company names/domains/LinkedIn URLs is enough to get started."
+
+Only skip this prompt if the user explicitly says they want a one-off single-entity lookup and don't need results saved.
+
+---
 
 **Server prefix:** `mcp__syncgtm__`  
 **Credit reference:** `syncgtm-mcp-tools.txt` at repo root.
@@ -45,6 +57,8 @@ Different tools require different identifiers. Check what's available before cal
 | `find_linkedin_from_personal_email` | `email` (personal) | — |
 | `enrich_organization`, `find_company_techstack`, `find_company_website_traffic` | `domain` | — |
 | `find_people_within_company`, `company_job_listings` | `domain` or company name | — |
+| `search_job_listings` | job title / keywords (no domain needed) | — |
+| `linkedin_page_jobs`, `linkedin_employee_finder` | LinkedIn company URL or name | — |
 | `enrich_linkedin_page`, `linkedin_page_posts`, `premium_linkedin_page_insights`, `job_openings_growth_rate`, `head_count_growth_rate` | LinkedIn company URL or name | — |
 
 **LinkedIn URL gate:** If the user asks for email/phone/profile enrichment and `linkedin_url` column is missing or empty for the target rows — **do not silently skip**. Ask:
@@ -101,8 +115,11 @@ attempt 1 → fail → wait 10s → retry 1 → fail → wait 10s → retry 2
 | "find tech stack", "techstack" | Company Enrichment → Techstack |
 | "website traffic", "company traffic" | Company Enrichment → Traffic |
 | "find people at company", "employees", "people in company" | Company Enrichment → People |
-| "find decision makers", "decision makers", "who to contact" | Find Decision Makers |
-| "job listings", "hiring signals", "open roles" | Company Enrichment → Job Listings |
+| "find decision makers", "decision makers", "who to contact" — **from LinkedIn** | Find Decision Makers → `linkedin_employee_finder` |
+| "find decision makers", "employees" — **company has domain** | Find Decision Makers → `find_people_within_company` |
+| "job listings", "hiring signals", "open roles" — **company has domain** | `company_job_listings` (STRICTLY) |
+| "build lead list from job listings", "find companies hiring for X" | `search_job_listings` (STRICTLY) |
+| "job listings from company LinkedIn", "company LinkedIn jobs" | `linkedin_page_jobs` (STRICTLY) |
 | "google maps", "maps listings", "local businesses" | Google Maps Scraper |
 | "LinkedIn company page", "company page data" | LinkedIn Company Page |
 | "company posts", "LinkedIn page posts" | LinkedIn Company Page → Posts |
@@ -347,20 +364,31 @@ After outputting results, ask: "Want me to find decision makers at these compani
 
 ### Find Decision Makers
 
-Triggered when user says "find decision makers", "who should I contact", "find the right person", or after job listings / people search surfaces target companies.
+Triggered when user says "find decision makers", "who should I contact", "find the right person", "find employees", or after job listings / people search surfaces target companies.
+
+**Tool selection is STRICT — do not mix these up:**
+
+| Signal | Tool |
+|---|---|
+| User has a **domain / website** for the company | **STRICTLY** `mcp__syncgtm__find_people_within_company` |
+| User has a **LinkedIn company URL or name** | **STRICTLY** `mcp__syncgtm__linkedin_employee_finder` |
 
 **Workflow:**
 
-1. **Ask who their ICP is first:**
+1. **Determine identifier type** — does the user/CSV have a domain or a LinkedIn company URL?
+
+2. **Ask who their ICP is:**
    > "Who is your ideal contact at these companies? (e.g. VP of Sales, Head of RevOps, CTO, Founder) — I'll filter results by title."
 
-2. Use the ICP title as the `title` filter in `mcp__syncgtm__find_people_within_company`.
+3a. **If domain available → `mcp__syncgtm__find_people_within_company`**  
+   **Requires:** `domain`  
+   **Pass:** `title=[ICP title]`, `max_results=5` (or ask user how many per company)
 
-3. **Tool:** `mcp__syncgtm__find_people_within_company`  
-   **Requires:** `domain` (from the company list or CSV)  
-   **Pass:** `title=[ICP title from user]`, `max_results=5` (or ask user how many per company)
+3b. **If LinkedIn company URL/name available → `mcp__syncgtm__linkedin_employee_finder`**  
+   **Requires:** LinkedIn company URL or name  
+   **Pass:** `title=[ICP title]`, `max_results=5`
 
-4. **Output columns** (same as Find People, one row per result):
+4. **Output columns** (one row per result):
 
 | Column | Content |
 |---|---|
@@ -378,6 +406,8 @@ Triggered when user says "find decision makers", "who should I contact", "find t
 
 ### Company Job Listings — 0.5 credits/result
 
+> **STRICT RULE:** If the user asks for job listings of a company **that has a domain**, use THIS tool ONLY — never `linkedin_page_jobs` or `search_job_listings`.
+
 **Tool:** `mcp__syncgtm__company_job_listings`  
 **Requires:** company domain or name  
 **Optional:** `company_linkedin_url`, `workplace_type`, `max_results`, `job_titles_include`, `job_titles_exclude`, `posted_after`, `posted_before`, `keywords`, `remote`
@@ -394,6 +424,53 @@ Triggered when user says "find decision makers", "who should I contact", "find t
 | `Posted Date` | When the job was posted |
 
 After running, ask: "Want me to find decision makers at these companies? I can look for the hiring manager or the buyer persona you're targeting."
+
+---
+
+### Build Lead List from Job Listings — Search Across Companies
+
+> **STRICT RULE:** If the user wants to **build a lead list by searching job listings** (e.g. "find companies hiring SDRs", "find companies that have open roles in RevOps"), use THIS tool ONLY — never `company_job_listings`.
+
+**Tool:** `mcp__syncgtm__search_job_listings`  
+**Use case:** Prospect discovery — find companies actively hiring for roles that signal a buying need (e.g. "Hiring a VP of Sales" → likely needs sales tools).  
+**Optional filters:** `job_title`, `keywords`, `company_size`, `industry`, `location`, `posted_after`, `max_results`
+
+**Output columns** (one row per matching job listing):
+
+| Column | Content |
+|---|---|
+| `Company Name` | Company with the open role |
+| `Domain` | Company website |
+| `Job Title` | Title of the open role |
+| `Job URL` | Direct link to the posting |
+| `Job Description` | Truncated description (500 chars, `[truncated]`) |
+| `Posted Date` | When the role was posted |
+| `Location` | Job location |
+
+After running, offer: "Want me to find decision makers at these companies? I can filter by your ICP title."
+
+---
+
+### LinkedIn Company Page Job Listings
+
+> **STRICT RULE:** If the user wants to find job listings via a **company's LinkedIn page** (has a LinkedIn company URL or name, not a domain), use THIS tool ONLY — never `company_job_listings`.
+
+**Tool:** `mcp__syncgtm__linkedin_page_jobs`  
+**Requires:** LinkedIn company URL or company name  
+**Optional:** `max_results`, `job_titles_include`, `posted_after`, `keywords`, `remote`
+
+**Output columns** (one row per job listing):
+
+| Column | Content |
+|---|---|
+| `Job Title` | Title of the open role |
+| `Job URL` | Direct URL to the LinkedIn job posting |
+| `Job Description` | Truncated description (500 chars, `[truncated]`) |
+| `Posted Date` | When the job was posted |
+| `Location` | Job location |
+| `Workplace Type` | Remote / Hybrid / On-site |
+
+After running, ask: "Want me to find decision makers at this company via their LinkedIn page?"
 
 ---
 
@@ -624,8 +701,11 @@ If `total cost > 50 credits`, ask for explicit confirmation before proceeding.
 | `enrich_organization` | 2cr | domain | Company profile |
 | `find_company_techstack` | 1cr | domain | Tech stack |
 | `find_company_website_traffic` | 1cr | domain | Traffic data |
-| `find_people_within_company` | 0.5cr/result | domain | Prospect list from company |
-| `company_job_listings` | 0.5cr/result | domain or name | Open roles / hiring signal |
+| `find_people_within_company` | 0.5cr/result | domain | Decision makers/employees when company has domain |
+| `linkedin_employee_finder` | 0.5cr/result | LinkedIn company URL or name | Decision makers/employees from LinkedIn |
+| `company_job_listings` | 0.5cr/result | domain or name | Job listings when company has domain (STRICT) |
+| `search_job_listings` | 0.5cr/result | job title/keywords | Build lead list from job listings (STRICT) |
+| `linkedin_page_jobs` | 0.5cr/result | LinkedIn company URL or name | Job listings from company's LinkedIn (STRICT) |
 | `enrich_linkedin_page` | 0.5cr | LinkedIn id/URL/name | Company page data |
 | `premium_linkedin_page_insights` | 2cr | LinkedIn id/URL/name | Growth trends |
 | `linkedin_page_posts` | 1cr | company_url | Company page posts |
